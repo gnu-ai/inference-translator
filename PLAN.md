@@ -538,6 +538,28 @@ phases sont prioritaires.
   les points de montage et les contrats, jamais les binaires de la
   pile.
 
+### Stratégie de tests unitaires
+
+- **Harnais maison minimal** : macros `CHECK` et compteurs en
+  C23/POSIX, zéro framework externe — même convention que
+  `tests/test_neuron.c` (`neuron-translator`) et la suite
+  d'`httpfs-translator` ; `make check` est la cible standard, exigée
+  par les critères d'acceptation.
+- **Le noyau d'extraction d'abord** : détection d'URLs, détection de
+  tâche, extraction de paramètres — pur POSIX, sans terminal,
+  testable sur toute machine comme le noyau de neuron ; les tests
+  dérivent du contrat gelé (le JSON de la section 3.3), jamais de
+  l'implémentation.
+- **Le contrat POSIX est le premier test** :
+  `echo … | tee /inference/prompt && cat /inference/request` fait
+  partie de la suite, exécuté sur le translator réellement monté.
+- **Client sans décor parasite** : tests via pseudo-terminaux ; en
+  sortie non-TTY (tube ou fichier), aucun code ANSI ne doit fuir,
+  `NO_COLOR` est respecté.
+- **Mode distant isolé** : sshd de test sur boucle locale (clé
+  refusée, révocation à chaud, coupure de session) — jamais un
+  réseau réel dans la suite.
+
 ---
 
 ## 7. Jalons synthétiques
