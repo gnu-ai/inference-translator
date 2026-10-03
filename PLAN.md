@@ -520,6 +520,13 @@ phases sont prioritaires.
 - **Zéro allocation dans les chemins chauds** : les chemins d'affichage
   réutilisent des buffers pré-alloués, cohérent avec les choix de
   performance de la pile.
+- **Multitâche et multi-utilisateurs** : le translator doit accepter
+  plusieurs utilisateurs **simultanément** — un prompt, une
+  requête et une session par utilisateur, sans interférence entre
+  elles ; aucun état global non protégé ne doit sérialiser les
+  utilisateurs ; en mode distant, un serveur `inference` par
+  session SSH (section 3.5) porte cette exigence, le registre des
+  clés de `/db` servant plusieurs utilisateurs nommés à la fois.
 - **Pas de dépendance TUI** : ANSI + `termios` uniquement ; `NO_COLOR`
   et les sorties non-TTY désactivent tout décor.
 - **Zéro bibliothèque de chiffrement** : le mode distant invoque le
