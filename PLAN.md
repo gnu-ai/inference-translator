@@ -378,6 +378,20 @@ l'existence de `httpfs` ou de PostgreSQL : ces détails restent dans
 l'orchestrateur, conformément au principe « chaque translator reste
 remplaçable ».
 
+### Le cluster dès la phase 3 : un transport SSH minimal avant le mode distant complet
+
+Le client `inference` peut piloter une pile **distante** dès la
+phase 3 — le trio JSON transite par un canal SSH minimal vers
+l'orchestrateur d'un cluster Hurd — bien avant la phase 5 (serveur
+par session, clés révocables). Pourquoi ce placement : le trio
+`request`/`status`/`result` est l'invariant **des deux modes**, et
+le cluster est une propriété de la pile, pas une commodité d'accès.
+Faire transiter le trio par SSH dès la phase 3 prouve le contrat
+sur les deux transports (fichiers locaux, canal SSH) avant que
+l'ergonomie du mode distant complet n'existe. La phase 5 n'ajoute
+alors que la sécurité nominative (registre, révocation) et le
+serveur par session — jamais de reprise du contrat lui-même.
+
 ---
 
 ## 5. Phases
@@ -442,8 +456,15 @@ phases sont prioritaires.
   à écrire sur la sortie, réaffichage propre.
 - Lecture incrémentale de `status` (type 2) puis du `result`
   (type 3) dès leur production par l'agrégateur.
+- **Mode cluster dès cette phase** : le client `inference` peut
+  piloter une pile **distante** — le trio JSON transite par un
+  canal SSH minimal vers l'orchestrateur d'un cluster Hurd
+  (2 à 5 nœuds) ; le mode distant complet (serveur `inference`
+  par session SSH, registre des clés nominatives révocables)
+  reste approfondi en phase 5.
 - **Livrable** : IHM complète contre un orchestrateur simulé par
-  fichiers de test.
+  fichiers de test, y compris à travers le canal SSH du cluster
+  (simulé en boucle locale).
 - **Acceptation** : démonstration visuelle sans scintillement
   (réaffichage atomique), respect de `NO_COLOR` et des redirections
   non-TTY (pas d'ANSI vers un tube).
