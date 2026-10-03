@@ -20,9 +20,9 @@ statut, résultat) à
 [orchestrator-translator](https://github.com/gnu-ai/orchestrator-translator).
 Il ne fait ni calcul neuronal, ni requête réseau applicative, ni
 persistance lui-même : il traduit l'intention de l'utilisateur en
-requête POSIX — ou en trames JSON chiffrées quand GNU AI tourne dans
-un **datacenter ou un cluster local**, accessible avec une **clé par
-utilisateur**.
+requête POSIX — ou en trames JSON transitant par une session **SSH**
+chiffrée quand GNU AI tourne dans un **datacenter ou un cluster
+local**, accessible avec une **clé SSH nominative par utilisateur**.
 
 Licence : GPLv3 ou version ultérieure. Langage : C23, POSIX.1-2008,
 interfaces Hurd (`trivfs` pour le MVP, `netfs` dès que l'arborescence
@@ -73,9 +73,10 @@ ne voie la différence :
   `/orchestrate`, tout passe par le système de fichiers.
 - **Mode distant** : la pile GNU AI (inference, orchestrateur,
   neurones, PostgreSQL) tourne dans un **datacenter ou un cluster
-  local** ; l'utilisateur n'a localement que l'IHM, qui se connecte
-  au serveur `inference` distant par une **socket TCP chiffrée** et
-  s'authentifie avec une **clé par utilisateur**.
+  local** ; l'utilisateur n'a localement que l'IHM, qui ouvre une
+  **session SSH** vers le cluster (authentification par clé SSH
+  nominative) ; les trames JSON du contrat transitent par le canal
+  SSH.
 
 L'invariant est le trio de requêtes JSON de la section 3.3 : en
 local ce sont des fichiers lus dans `/inference` et `/orchestrate`,
@@ -116,11 +117,13 @@ en distant ce sont des trames portant exactement les mêmes objets.
    puis du `result` final (effet machine à écrire) ; les statuts
    intermédiaires sont affichés comme des données, non comme des
    erreurs.
-9. **Mode distant datacenter/cluster** : un démon `inference-serveur`
-   écoute sur TCP chiffré, authentifie l'utilisateur par clé, et
-   relaie le cycle `request` → `status` → `result`. Les clés sont
-   **par utilisateur**, émises par l'opérateur du cluster et
-   **révocables côté serveur** sans redéploiement.
+9. **Mode distant datacenter/cluster** : le client ouvre une
+   **session SSH** vers le cluster (`inference --remote
+   utilisateur@hôte`) ; un processus serveur lancé par la session
+   relaie le cycle `request` → `status` → `result` sur le canal
+   chiffré. L'authentification repose sur des **clés SSH
+   nominatives**, enregistrées par l'opérateur et **révocables côté
+   serveur** sans redéploiement.
 10. **Interface translator** : `/inference` reste pilotable en pur
     POSIX (`cat`, `tee`, `settrans`), donc scriptable et testable
     sans terminal ; le mode local n'a besoin ni de socket ni de clé.
@@ -149,13 +152,14 @@ en distant ce sont des trames portant exactement les mêmes objets.
 
 ```
   machine utilisateur            datacenter / cluster local
-┌────────────────────┐  TCP+TLS  ┌────────────────────────────┐
-│ client `inference` │◄─────────►│ démon inference-serveur    │
-│ (IHM, éditeur,     │  trames   │  │ auth par clé utilisateur │
-│  couleurs)         │  JSON     │  ▼                         │
-└────────────────────┘           │ /inference, /orchestrate,  │
-   clé: ~/.inference/keys/       │ neurones, PostgreSQL       │
-        <cluster>.key            └────────────────────────────┘
+┌────────────────────┐   SSH     ┌─────────────────────────────┐
+│ client `inference` │◄─────────►│ sshd ──► inference-serveur │
+│ (IHM, éditeur,     │  trames   │ (processus lancé par session,│
+│  couleurs)         │  JSON     │  aucun port d'écoute dédié)  │
+└────────────────────┘           │   ▼                         │
+   clé SSH nominative             │ /inference, /orchestrate,  │
+   (ed25519, agent standard)      │ neurones, PostgreSQL       │
+                                 └─────────────────────────────┘
 ```
 
 L'orchestrateur poursuit ensuite son flux nominal (httpfs →
@@ -236,44 +240,50 @@ défaut.
 └── version     (read)   version et contrats supportés
 ```
 
-### 3.5 Mode distant : protocole filaire et clés
+### 3.5 Mode distant : SSH, protocole à trames et clés
 
-Le démon `inference-serveur` écoute sur TCP (port configurable) et
-parle un protocole minimal à trames :
+Le mode distant délègue le transport à **OpenSSH** :
 
-- **Chiffrement** : TLS via GnuTLS — le protocole de trames est
-  maison, la cryptographie ne l'est jamais (pas de chiffrement
-  artisanal).
+- **Session** : `inference --remote utilisateur@hôte` exécute
+  `ssh utilisateur@hôte inference-serveur`. Le processus serveur,
+  lancé par session, parle le protocole à trames sur les flux stdio
+  du tunnel SSH et n'accède qu'aux fichiers `/inference` et
+  `/orchestrate` du cluster.
+- **Chiffrement et authentification : délégués à OpenSSH** — aucun
+  port dédié à surveiller, aucun certificat à gérer, aucune
+  bibliothèque de chiffrement liée au projet.
 - **Trame** : en-tête fixe (type : `hello` | `request` | `status` |
   `result` | `error`, longueur de la charge) suivi d'une charge JSON
   — exactement les objets de la section 3.3 pour `request`, `status`
   et `result`.
-- **Poignée de main** : à la connexion, le client envoie
-  `hello { "version": 1, "key": "…" }` ; le serveur vérifie la clé
-  dans son registre et répond `accept` (avec son `version`) ou
-  `error` (clé inconnue ou révoquée). Aucune trame applicative n'est
-  acceptée avant `accept`.
+- **Poignée de main** : à l'ouverture, le client envoie
+  `hello { "version": 1 }` ; le serveur répond `accept` (avec sa
+  `version`) ou `error`. Aucun secret ne transite dans le protocole :
+  l'identité de l'utilisateur est celle de la clé SSH authentifiée
+  par sshd.
 
-**Clés par utilisateur** :
+**Clés SSH nominatives** :
 
-- Émises par l'opérateur du datacenter/cluster, à la manière des
-  clés API d'un fournisseur d'IA ; chaque clé identifie **un
-  utilisateur**, pas une machine.
-- Stockées côté client dans `~/.inference/keys/<hôte>.key`
-  (permissions 0600), jamais dans le dépôt ni dans les journaux ;
-  passées au client (`inference --remote hôte:port --key …`) ou
-  prises par défaut dans le répertoire ci-dessus.
-- **Révocables côté serveur** : le registre des clés vit dans
-  PostgreSQL via `data-base-translator` ; révoquer une clé bloque un
-  utilisateur sans toucher les autres, sans redéploiement.
-- Toute tentative échouée (`hello` refusé) est journalisée côté
-  serveur avec horodatage et origine.
+- Clés SSH standard (ed25519 recommandé), une identité par
+  utilisateur ; la partie privée ne quitte jamais la machine de
+  l'utilisateur.
+- **Enregistrées par l'opérateur** du datacenter/cluster dans le
+  registre (`users`, `access_keys`) servi par
+  `data-base-translator` ; le serveur `inference` **génère
+  `authorized_keys` depuis ce registre** — seule source de vérité
+  des accès distants.
+- **Révocables côté serveur** : révoquer une clé dans le registre
+  puis re-générer `authorized_keys` coupe l'utilisateur sans toucher
+  les autres, sans redéploiement.
+- Chaque échec d'authentification SSH est journalisé côté serveur
+  (empreinte soumise, origine, horodatage) dans `auth_failures`,
+  via `/db`.
 
 ### 3.6 Contrats d'interface (principe clé)
 
 En local, chaque interaction passe par le système de fichiers, jamais
-par des sockets ni des API propriétaires ; la socket du mode distant
-est l'unique exception, confinée au saut réseau. Les contrats
+par des sockets ni des API propriétaires ; le canal SSH du mode
+distant est l'unique exception, confiné au saut réseau. Les contrats
 suivants sont gelés dès la phase 0, alignés sur la section 3.3 du
 plan de l'orchestrateur :
 
@@ -283,7 +293,7 @@ plan de l'orchestrateur :
 | `orchestrator → inference` | `read` de la requête structurée `/inference/request` (type 1). |
 | `inference → orchestrator` | `read` de `status` (type 2) et `result` (type 3) sur `/orchestrate` ; l'interface n'écrit jamais dans l'orchestrateur. |
 | `client → éditeur` | `fork`/`exec` de `$VISUAL` (sinon `$EDITOR`, sinon nano, sinon vi) sur un fichier temporaire ; relecture du buffer si code de sortie nul. Aucun éditeur ne nécessite de protocole dédié. |
-| `client distant → serveur` | TCP+TLS, trames `hello` puis `request`/`status`/`result`/`error` ; clé par utilisateur vérifiée à la poignée de main. |
+| `client distant → serveur` | session SSH (OpenSSH) : trames `hello` puis `request`/`status`/`result`/`error` sur le canal chiffré ; identité portée par la clé SSH nominative authentifiée par sshd. |
 
 ---
 
@@ -299,38 +309,40 @@ permet d'utiliser l'un sans l'autre. C'est la convention Hurd
 client ne fait que des `open`/`read`/`write` sur `/inference` et
 `/orchestrate`.
 
-### Pourquoi une socket TCP dédiée en mode distant, et pas httpfs ?
+### Pourquoi SSH en mode distant, et pas httpfs ni une socket dédiée ?
 
 `httpfs-translator` est un transport **unidirectionnel de contenu
-récupéré** (lecture de `content`/`headers`/`status`) : il n'offre ni
-poignée de main authentifiée, ni canal bidirectionnel, ni
-notification. Le mode distant a besoin des trois : soumettre le
-prompt, suivre `status`, recevoir `result` en streaming, le tout avec
-une clé par utilisateur. D'où une socket TCP dédiée, porteuse du
-**même trio JSON** que le mode local — le contrat ne change pas, seul
-le transport diffère. La socket est l'unique exception à « tout par
-le système de fichiers », et elle est confinée au saut réseau : dès
-que les trames sont reçues côté serveur, tout redevient des fichiers
-(`/inference`, `/orchestrate`) dans le datacenter.
+récupéré** (lecture de `content`/`headers`/`status`) : ni poignée
+de main authentifiée, ni canal bidirectionnel, ni notification. Une
+socket TCP dédiée exigerait de gérer nous-mêmes port d'écoute,
+certificats et chiffrement. OpenSSH donne tout ce dont le mode
+distant a besoin — chiffrement, authentification par clé, contrôle
+d'accès, journalisation — et tourne déjà sur tout serveur : le
+client invoque le binaire `ssh`, le serveur n'écoute sur aucun port.
+Le contrat ne change pas : le canal SSH porte le **même trio JSON**
+que le mode local. L'exception à « tout par le système de fichiers »
+est confinée au saut réseau : côté cluster, le processus serveur ne
+parle qu'aux fichiers `/inference` et `/orchestrate`.
 
-### Chiffrement : TLS, pas de cryptographie maison
+### Chiffrement et authentification : délégués à OpenSSH
 
-Le protocole de trames (en-tête + JSON) est défini ici, mais le
-chiffrement et l'authenticité de la connexion sont délégués à GnuTLS.
-Écrire son propre chiffrement est exclu. Conséquence assumée : le
-mode distant ajoute une dépendance (GnuTLS) que le mode local n'a
-pas ; le binaire client compile sans GnuTLS si le mode distant est
-désactivé à la configuration.
+Le protocole de trames (en-tête + JSON) est défini ici ; tout le
+reste — chiffrement du canal, authentification de l'utilisateur,
+contrôle des tentatives — est délégué à OpenSSH. Aucune
+cryptographie n'est écrite dans ce projet, aucune bibliothèque TLS
+n'est liée : le mode distant n'exige que le binaire `ssh` sur le
+poste utilisateur et `sshd` sur le cluster, standards du système.
 
-### Clés par utilisateur, révocables
+### Clés SSH nominatives, révocables
 
-Modèle choisi : celui d'un fournisseur d'IA — l'opérateur du
-cluster émet des clés nominatives, les vérifie à chaque poignée de
-main, et peut en révoquer une côté serveur (registre dans
-PostgreSQL via `data-base-translator`) sans redéployer ni toucher
-les autres utilisateurs. Une clé n'identifie pas une machine :
-le même utilisateur peut se connecter depuis plusieurs postes avec
-la même clé ; la révocation le coupe de partout.
+Modèle choisi : les clés SSH standard de l'utilisateur, à la manière
+d'un accès git — l'opérateur enregistre la clé **publique**
+nominative dans le registre (PostgreSQL via
+`data-base-translator`), le serveur génère `authorized_keys` depuis
+ce registre, et révoquer une clé coupe l'utilisateur sans
+redéploiement. Une clé n'identifie pas une machine : le même
+utilisateur peut se connecter depuis plusieurs postes ; la révocation
+le coupe de partout.
 
 ### Pas de bibliothèque TUI
 
@@ -379,8 +391,9 @@ phases sont prioritaires.
 
 - Gel du **trio de requêtes JSON** `request`/`status`/`result`
   (section 3.3) et de l'arborescence `/inference` (section 3.4).
-- Gel du protocole filaire distant : format de trame, poignée de main
-  `hello`, gestion de version, format et emplacement des clés.
+- Gel du mode distant : transport SSH (commande serveur, arguments,
+  session), format de trame, poignée de main `hello`, gestion de
+  version, registre des clés publiques SSH.
 - Protocole éditeur : ordre de résolution `$VISUAL` → `$EDITOR` →
   `nano` → `vi`, fichier temporaire, sémantique du code de sortie.
 - Palette et conventions d'affichage (codes ANSI, thèmes de base,
@@ -389,8 +402,9 @@ phases sont prioritaires.
 - **Livrable** : `SPEC.md` + squelette de code compilable.
 - **Acceptation** : revue croisée des contrats avec
   `orchestrator-translator` — le `read` de `/inference/request` doit
-  suffire à sa phase 3 sans modification de son code ; le schéma du
-  registre de clés validé avec `data-base-translator`.
+  suffire à sa phase 3 sans modification de son code ; le registre
+  des clés SSH (`users`/`access_keys`) validé avec
+  `data-base-translator`.
 
 ### Phase 1 — MVP : le translator `/inference` (mode local)
 
@@ -446,25 +460,26 @@ phases sont prioritaires.
   `tee`/`cat` purs ; dépend des phases 1–3 d'
   `orchestrator-translator`.
 
-### Phase 5 — Mode distant : datacenter et cluster local
+### Phase 5 — Mode distant : SSH, datacenter et cluster local
 
-- Démon `inference-serveur` : écoute TCP+TLS (GnuTLS), poignée de
-  main `hello` avec vérification de clé, relais des trames
-  `request`/`status`/`result` vers `/inference` et `/orchestrate`
-  locaux au serveur.
-- Registre des clés par utilisateur dans PostgreSQL via
-  `data-base-translator` ; émission, vérification à chaque poignée
-  de main, **révocation côté serveur**, journal des tentatives
-  refusées.
-- Côté client : `inference --remote hôte:port --key fichier` ; en
-  l'absence de ces options, comportement local inchangé.
+- Processus `inference-serveur` lancé par session SSH
+  (`ssh utilisateur@hôte inference-serveur`), parlant le protocole
+  à trames sur stdio et reliant `/inference` et `/orchestrate`
+  locaux au cluster ; aucun port d'écoute dédié.
+- Registre des clés publiques SSH nominatives dans PostgreSQL via
+  `data-base-translator` ; enregistrement, génération de
+  `authorized_keys` depuis le registre, **révocation côté serveur**,
+  journal des tentatives SSH refusées.
+- Côté client : `inference --remote utilisateur@hôte`
+  (authentification SSH standard : agent ou clé de l'utilisateur) ;
+  sans cette option, comportement local inchangé.
 - **Livrable** : une pile GNU AI complète exécutée sur un cluster
   local (plusieurs machines ou conteneurs), IHM sur le poste
   utilisateur.
 - **Acceptation** : le même prompt donne le même résultat en mode
-  local et distant, sans rien changer au client sauf
-  `--remote`/`--key` ; la révocation d'une clé bloque son
-  utilisateur sans affecter les autres.
+  local et distant, sans rien changer au client sauf `--remote` ;
+  la révocation d'une clé bloque son utilisateur sans affecter les
+  autres ; le serveur n'écoute sur aucun port autre que sshd.
 
 ### Phase 6 — Historique et ergonomie de session
 
@@ -484,8 +499,9 @@ phases sont prioritaires.
 
 - Tests déterministes du translator (suites POSIX sans terminal),
   tests du client via pseudo-terminaux.
-- Tests du mode distant : TLS sur boucle locale, clé invalide,
-  révocation à chaud, coupure réseau en cours d'exécution.
+- Tests du mode distant : sshd de test sur boucle locale, clé
+  refusée, révocation à chaud, coupure de session en cours
+  d'exécution.
 - CI sous QEMU GNU/Hurd, pilotée par le sandbox
   [gnu-ai/mistral-vm-debian-hurd](https://github.com/gnu-ai/mistral-vm-debian-hurd).
 - Documentation utilisateur (`docs/interface.md`, `docs/remote.md`)
@@ -506,17 +522,18 @@ phases sont prioritaires.
   performance de la pile.
 - **Pas de dépendance TUI** : ANSI + `termios` uniquement ; `NO_COLOR`
   et les sorties non-TTY désactivent tout décor.
-- **Une seule dépendance réseau : GnuTLS**, requise uniquement par le
-  mode distant ; le mode local et le translator seul compilent et
-  fonctionnent sans elle.
+- **Zéro bibliothèque de chiffrement** : le mode distant invoque le
+  binaire `ssh` (OpenSSH) et délègue tout le transport sécurisé ;
+  le mode local et le translator seul n'ont aucune dépendance
+  réseau.
 - **Interface muette côté translator, narration côté client** :
   `/inference` n'expose que des données interprétables.
 - **Erreurs réseau ≠ erreurs POSIX** : un statut HTTP non-200 vu dans
   un résultat est une donnée affichée en couleur d'information
   (philosophie `httpfs`), jamais une erreur de l'interface.
-- **Clés : jamais dans le dépôt, jamais dans les journaux** ;
-  fichiers `~/.inference/keys/` en 0600 ; le registre serveur vit
-  dans PostgreSQL.
+- **Clés SSH : standard OpenSSH** ; la partie privée ne quitte jamais
+  la machine de l'utilisateur, seules les clés publiques sont
+  enregistrées dans le registre PostgreSQL.
 - Chaque translator reste remplaçable : l'interface ne connaît que
   les points de montage et les contrats, jamais les binaires de la
   pile.
@@ -527,12 +544,12 @@ phases sont prioritaires.
 
 | Phase | Contenu | Dépend de |
 |---|---|---|
-| 0 | Spécification, trio JSON, arborescence, protocole distant, clés | — |
+| 0 | Spécification, trio JSON, arborescence, mode distant SSH, clés | — |
 | 1 | MVP translator : prompt → `request` (mode local) | 0 |
 | 2 | Client `inference` : saisie, `$EDITOR`, narration | 1 |
 | 3 | Couleurs, animations, coloration, streaming | 2 |
 | 4 | Bout en bout avec `orchestrator-translator` | 1–3, orchestrateur 1–3 |
-| 5 | Mode distant : TCP+TLS, démon, clés révocables, cluster | 0, 4 |
+| 5 | Mode distant : SSH, serveur par session, clés révocables, cluster | 0, 4 |
 | 6 | Historique, `replay`, sessions | 2–4 |
 | 7 | Durcissement, CI Hurd, v1.0 | 1–6 |
 
@@ -540,6 +557,6 @@ La phase 1 de ce dépôt est un prérequis direct de la phase 3 de
 `orchestrator-translator` (acquisition réseau) : les deux fils de
 travail se synchronisent sur le contrat `/inference/request` gelé
 en phase 0. La phase 5 (mode distant) dépend du registre de clés
-chez `data-base-translator` et n'invalide aucun contrat local : le
-trio JSON `request`/`status`/`result` reste l'invariant des deux
-modes.
+SSH chez `data-base-translator` et n'invalide aucun contrat local :
+le trio JSON `request`/`status`/`result` reste l'invariant des deux
+modes, seul le transport diffère (fichiers locaux ou canal SSH).
